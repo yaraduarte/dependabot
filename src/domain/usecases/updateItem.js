@@ -1,0 +1,90 @@
+const { Ok, Err, usecase, step, ifElse } = require('@herbsjs/herbs')
+const { herbarium } = require('@herbsjs/herbarium')
+const { Item } = require('../entities/item')
+
+const dependency = {
+  ItemRepository: require('../../infra/repositories/db/itemRepository'),
+}
+
+const updateItem = (injection) =>
+  usecase('Update Item', {
+    request: {
+      id: Number,
+      description: String,
+      isDone: Boolean,
+      position: Number
+    },
+
+    response: Item,
+
+    setup: ctx => (ctx.di = Object.assign({}, dependency, injection)),
+
+    authorize: async (user) => (user.canUpdateItem ? Ok() : Err()),
+
+    'Retrieve the previous Item from the repository': step(async (ctx) => {
+      const req = ctx.req
+      const repo = new ctx.di.ItemRepository(injection)
+      const ret = await repo.find({ where: { id: req.id } })
+      const item = (ctx.item = ret[0])
+
+      if (item === undefined) return Err.notFound({
+        message: `Item not found - ID: ${req.id}`,
+        payload: { entity: 'item' }
+      })
+
+      return Ok(item)
+    }),
+
+    'Check if it is a valid Item before update': step((ctx) => {
+      const req = ctx.req
+      const item = ctx.item
+
+      ctx.hasChangedPosition = (item.position !== req.position)
+      ctx.oldPosition = item.position
+
+      item.id = req.id
+      item.description = req.description
+      item.isDone = req.isDone
+      item.position = req.position
+
+      return item.isValid() ? Ok() : Err.invalidEntity({
+        message: `Item is invalid`,
+        payload: { entity: 'item' },
+        cause: JSON.stringify(item.errors)
+      })
+    }),
+
+    'Check if is necessary to update tasks positions': ifElse({
+      'If position has changed': step((ctx) => {
+        return Ok(ctx.hasChangedPosition)
+      }),
+
+      'Then rearrange positions and save itens on repository': step(async (ctx) => {
+        const req = ctx.req
+        const item = ctx.item
+
+        const repo = new ctx.di.ItemRepository(injection)
+        const itemList = await repo.find({ where: { listId: item.listId } })
+
+        const itemToMove = itemList.find((item) => item.id !== req.id && item.position === req.position)
+
+        if (itemToMove) {
+          itemToMove.position = ctx.oldPosition
+          await repo.update(itemToMove)
+        }
+
+        return (ctx.ret = await repo.update(ctx.item))
+      }),
+
+      'Else save updated item on repository': step(async (ctx) => {
+        const repo = new ctx.di.ItemRepository(injection)
+        return (ctx.ret = await repo.update(ctx.item))
+      }),
+    }),
+  })
+
+module.exports.updateItem =
+  herbarium.usecases
+    .add(updateItem, 'UpdateItem')
+    .metadata({ group: 'Items', operation: herbarium.crud.update, entity: Item })
+    .usecase
